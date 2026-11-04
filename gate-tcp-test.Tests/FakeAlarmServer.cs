@@ -72,8 +72,8 @@ sealed class FakeAlarmServer : IAsyncDisposable
         }
     }
 
-    public BridgeConfig Config() => BridgeConfig.Parse(
-        JsonSerializer.Serialize(new { serverUrl = BaseUrl.ToString(), gates = new Dictionary<string, string> { ["169.254.68.93"] = "GATE-1" } }),
+    public BridgeConfig Config(IReadOnlyDictionary<string, string>? gates = null) => BridgeConfig.Parse(
+        JsonSerializer.Serialize(new { serverUrl = BaseUrl.ToString(), gates = gates ?? new Dictionary<string, string> { ["169.254.68.93"] = "GATE-1" } }),
         w => throw new InvalidOperationException(w));
 
     public async ValueTask DisposeAsync()
@@ -84,21 +84,36 @@ sealed class FakeAlarmServer : IAsyncDisposable
     }
 }
 
-// Collects the bridge's printed lines (they go to the console in the real app).
-sealed class LogLines
+// Collects the printed lines (they go to the console in the real app). With echo, each line is also written to the
+// test output, timestamped like the app's console.
+sealed class LogLines(Xunit.Abstractions.ITestOutputHelper? echo = null)
 {
     readonly ConcurrentQueue<string> lines = new();
-    public void Add(string line) => lines.Enqueue(line);
+
+    public void Add(string line)
+    {
+        lines.Enqueue(line);
+        try { echo?.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {line}"); }
+        catch (InvalidOperationException) { } // xunit refuses output once the test has ended; the line is still kept here
+    }
+
     public IReadOnlyList<string> All => lines.ToArray();
     public int Count(string prefix) => lines.Count(l => l.StartsWith(prefix, StringComparison.Ordinal));
+    public int CountContaining(string text) => lines.Count(l => l.Contains(text, StringComparison.Ordinal));
 
-    public async Task WaitFor(string prefix, TimeSpan timeout, int count = 1)
+    public Task WaitFor(string prefix, TimeSpan timeout, int count = 1) =>
+        Until(() => Count(prefix) >= count, $"\"{prefix}\" line", timeout);
+
+    public Task WaitForContaining(string text, TimeSpan timeout, int count = 1) =>
+        Until(() => CountContaining(text) >= count, $"line containing \"{text}\"", timeout);
+
+    async Task Until(Func<bool> done, string what, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
-        while (Count(prefix) < count)
+        while (!done())
         {
             if (DateTime.UtcNow > deadline)
-                throw new TimeoutException($"no \"{prefix}\" line after {timeout.TotalSeconds} s. Lines:\n{string.Join("\n", All)}");
+                throw new TimeoutException($"no {what} after {timeout.TotalSeconds} s. Lines:\n{string.Join("\n", All)}");
             await Task.Delay(25);
         }
     }

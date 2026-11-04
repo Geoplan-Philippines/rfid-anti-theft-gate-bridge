@@ -1,6 +1,8 @@
 // gate-tcp-test: hosts the card_7k.dll TCP server for the RFID7000 gate and logs every callback.
 // With a gate-bridge.json next to the exe it also sends every tag to the anti-theft server (see GateBridge.cs).
 // API source of truth: ..\hax_7k_adapt.h (32-bit only, #pragma pack(1), default cdecl calling convention).
+// "sdkMode": "v2" in gate-bridge.json switches to HAX's packet interface instead: this app runs the TCP server
+// itself and the DLL only builds and parses packets (RunV2, V2GateServer.cs, sdk-v2\hax_7k_sdk.h).
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -120,8 +122,18 @@ static class Program
         }
 
         Log($"gate-tcp-test starting, {(Environment.Is64BitProcess ? 64 : 32)}-bit process, log file {LogPath}");
-        StartBridge();
-        if (!LoadSdk())
+        BridgeConfig config;
+        try { config = BridgeConfig.Load(Path.Combine(AppContext.BaseDirectory, BridgeConfig.FileName), problem => Log($"WARNING: {problem}")); }
+        catch (ConfigException ex)
+        {
+            Log($"ERROR: {BridgeConfig.FileName}: {ex.Message}");
+            PauseIfInteractive();
+            return 2;
+        }
+        StartBridge(config);
+        if (config.SdkMode == SdkMode.V2) return RunV2(config, argsGiven: args.Length > 0);
+
+        if (!LoadSdk(out _))
         {
             PauseIfInteractive();
             return 1;
@@ -188,6 +200,60 @@ static class Program
         }
     }
 
+    // v2 mode. The old DLL's TCP server, auto read and callbacks are never touched: this app listens for the gates
+    // itself and only asks card_7k.dll to build and parse packets.
+    static int RunV2(BridgeConfig config, bool argsGiven)
+    {
+        Log($"MODE        v2: this app listens on {config.ListenIp}:{config.ListenPort}, alarm channels " +
+            $"{DeviceAlarmConfig.From(config.AlarmChannels)}, reply timeout {config.ReplyTimeout.TotalMilliseconds:0} ms");
+        if (argsGiven)
+            Log($"WARNING: the [listen-ip] [port] arguments only apply to legacy mode. v2 uses listenIp and listenPort from {BridgeConfig.FileName}.");
+        if (!LoadSdk(out IntPtr dll))
+        {
+            PauseIfInteractive();
+            return 1;
+        }
+        NativeHaxSdk? sdk = NativeHaxSdk.TryCreate(dll);
+        if (sdk == null)
+        {
+            Log(NativeHaxSdk.MissingFunctionsMessage);
+            return 1;
+        }
+
+        var server = new V2GateServer(sdk, config, (reader, epc) => bridge?.OfferForReader(reader, epc), Log);
+        try { server.Start(); }
+        catch (SocketException ex)
+        {
+            Log($"ERROR: cannot listen on {config.ListenIp}:{config.ListenPort}: {ex.Message}");
+            Log("Is another program (or another copy of this app) using that port, or is listenIp not an address of this PC?");
+            PauseIfInteractive();
+            return 1;
+        }
+        string where = config.ListenIp.Equals(IPAddress.Any) ? "one of: " + string.Join(", ", LocalIPv4()) : config.ListenIp.ToString();
+        Log($"Waiting for gates. Point each gate at {where}, port {config.ListenPort}");
+        Console.WriteLine("Keys: Q = quit (A, L, B0 and B1 only work in legacy mode)");
+
+        while (true)
+        {
+            char key = char.ToUpperInvariant(ReadKey());
+            switch (key)
+            {
+                case 'A':
+                case 'L':
+                    Log($"{key}: not available in v2 mode");
+                    break;
+                case 'B':
+                    Log("B0/B1: not available in v2 mode");
+                    break;
+                case 'Q':
+                    server.Stop(TimeSpan.FromSeconds(2));
+                    bridge?.Stop(TimeSpan.FromSeconds(3));
+                    Log("exiting");
+                    return 0;
+            }
+        }
+    }
+
     // Callbacks run on DLL threads. An exception escaping into native code would kill the process, so catch everything.
     static void PortConnecting(IntPtr connId)
     {
@@ -239,11 +305,9 @@ static class Program
         catch (Exception ex) { Log($"ERROR in output_tags: {ex}"); }
     }
 
-    // Reads gate-bridge.json from next to the exe. Any problem leaves bridge null, so the app stays a log-only test.
-    static void StartBridge()
+    // config is gate-bridge.json from next to the exe. Any problem leaves bridge null, so the app stays a log-only test.
+    static void StartBridge(BridgeConfig config)
     {
-        string path = Path.Combine(AppContext.BaseDirectory, BridgeConfig.FileName);
-        BridgeConfig config = BridgeConfig.Load(path, problem => Log($"WARNING: {problem}"));
         if (config.AlarmUrl == null)
         {
             Log($"WARNING: alarms are NOT sent to the server, this run only logs tags. To send them, copy " +
@@ -347,8 +411,9 @@ static class Program
     }
 
     // Load card_7k.dll up front so a bad install gives a readable message instead of a crash on the first call.
-    static bool LoadSdk()
+    static bool LoadSdk(out IntPtr handle)
     {
+        handle = IntPtr.Zero;
         string dll = Path.Combine(AppContext.BaseDirectory, "card_7k.dll");
         if (!File.Exists(dll))
         {
@@ -358,7 +423,7 @@ static class Program
         try
         {
             Log("Loading card_7k.dll (takes a few seconds, up to about 10 s on the first run)...");
-            NativeLibrary.Load(dll);
+            handle = NativeLibrary.Load(dll);
             Log("card_7k.dll loaded");
             return true;
         }

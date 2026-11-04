@@ -58,5 +58,52 @@ because the server grabs a CCTV picture first):
 
 `Q` waits up to 3 s for tags still being sent, then quits as before. `A`, `L`, `B0` and `B1` are unchanged.
 
+## v2 mode (HAX's updated card_7k.dll)
+
+**What it is:** HAX's updated `card_7k.dll` no longer opens a port itself. In v2 mode this app listens for the gates
+and only asks the DLL to build the packets it sends and to read the packets the gates send back. Several gates can be
+connected at once. Legacy mode (everything above) stays the default and works exactly as before.
+
+**You need HAX's updated `card_7k.dll`.** Copy it over the old one in the output folder, `bin\Debug\net8.0\win-x86\`,
+together with any other DLL HAX sends with it. Leave the `..\sdk` folder alone, legacy mode still uses it.
+`dotnet build` copies `..\sdk\card_7k.dll` again only when it is newer than the one in the output folder, so after a
+`dotnet clean` or on a fresh copy of the project, copy HAX's DLL again.
+
+**Switch to v2:**
+1. In `gate-bridge.json` (see above; `gate-bridge.example.json` lists every setting) set `"sdkMode": "v2"`.
+2. Run `dotnet build` again, then run the app as before. The IP and port on the command line are for legacy mode only.
+3. Set each gate to connect to this PC's IP address and `listenPort` (**9000** by default, not 9090). The app prints
+   this PC's addresses when it starts. If Windows asks about the firewall, allow it as in step 3 at the top.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `sdkMode` | `"legacy"` | `"legacy"`: the old DLL runs the TCP server, as before. `"v2"`: this app runs it. |
+| `listenIp` | `"0.0.0.0"` | Address to listen on. `0.0.0.0` means every network card of this PC. |
+| `listenPort` | `9000` | Port the gates connect to. |
+| `alarmChannels` | `[1,1,1,1]` | Alarm channels 1 to 4, sent to each gate when it connects. `1` = on, `0` = off. |
+| `replyTimeoutMs` | `5000` | How long to wait for the gate's answer to each setup step, in milliseconds. |
+
+`serverUrl`, `cooldownSeconds` and `gates` work the same in both modes. A wrong value in one of the five settings above
+stops the app at startup with `ERROR: gate-bridge.json: ...`, which says what to write instead.
+
+**What to expect:** after `card_7k.dll loaded`, the line `Waiting for gates. Point each gate at ..., port 9000`.
+If the app prints `card_7k.dll has no Device_* functions. You need HAX's updated DLL.` and closes, the old DLL is
+still in the output folder.
+
+| Line | Meaning |
+|---|---|
+| `GATE OPEN   reader=GATE-1 remote=192.168.1.50:50113` | A gate connected. `reader` is its name from `gates`, or its IP. |
+| `TO GATE     reader=GATE-1 server control, 9 bytes: ...` | The packet the DLL built, sent to the gate, in hex. Setup step 1 takes control of the gate. |
+| `FROM GATE   reader=GATE-1 server control, 8 bytes: ...` | The gate's raw answer, in hex. |
+| `STEP        reader=GATE-1 server control: ok` | The DLL accepted the answer. The same three lines follow for `alarm channels` (setup step 2). |
+| `STEP FAILED reader=GATE-1 alarm channels: unpack failed (header/length/CRC), code 4` | The gate refused, its answer was not accepted, or it did not answer in time. The app closes this gate's connection only; the gate can connect again. Give HAX the code and the hex lines above it if this keeps happening. |
+| `TAG         reader=GATE-1 ant=1 epc=E2000017...` | A tag the gate read, and on which antenna. It is sent to the server exactly as in legacy mode (same cooldown, same `ALARM SENT` and other lines). |
+| `BAD PACKET  reader=GATE-1 ...` | A packet from the gate the DLL could not read, and why. It is skipped and the connection stays open. |
+| `GATE CLOSED reader=GATE-1 remote=... the gate disconnected` | The gate went away, or the line says why the connection ended. It can connect again at any time. |
+
+**Keys in v2:** `Q` stops listening, closes every gate connection, waits up to 3 s for tags still being sent, then
+quits. `A`, `L`, `B0` and `B1` only print `not available in v2 mode`.
+
 **Tests** (no gate or server needed): from the `gate-tcp-test.Tests` folder next to this one, run `dotnet test`.
-They take about a minute because one test runs a slow fake server for real.
+They take about a minute because one test runs a slow fake server for real. The v2 tests use a fake DLL and fake
+gates on this PC, so they need neither a gate nor HAX's updated DLL.

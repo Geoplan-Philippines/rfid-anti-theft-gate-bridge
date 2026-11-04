@@ -2,6 +2,7 @@
 // (POST {serverUrl}/api/v1/alarms). Nothing in this file touches card_7k.dll, so the 64-bit test project can
 // compile it directly (the app itself is 32-bit and cannot be loaded there).
 using System.Globalization;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -9,21 +10,43 @@ using System.Threading.Channels;
 
 namespace GateTcpTest;
 
+// legacy: card_7k.dll runs the TCP server and calls OutputTags. v2: this app runs the server (V2GateServer.cs).
+enum SdkMode { Legacy, V2 }
+
+// A gate-bridge.json value that would make the app talk to the gate wrongly. Unlike a warning, it stops the app at startup.
+sealed class ConfigException(string message) : Exception(message);
+
 // gate-bridge.json, read once at startup. AlarmUrl == null means log-only: tags are printed but never sent.
 sealed class BridgeConfig
 {
     public const string FileName = "gate-bridge.json";
     public const int DefaultCooldownSeconds = 30;
+    public const int DefaultListenPort = 9000;
+    public const int DefaultReplyTimeoutMs = 5000;
 
     public Uri? AlarmUrl { get; init; }
     public TimeSpan Cooldown { get; init; } = TimeSpan.FromSeconds(DefaultCooldownSeconds);
     public IReadOnlyDictionary<string, string> Gates { get; init; } = new Dictionary<string, string>();
+
+    // Used by v2 mode only; legacy mode ignores them.
+    public SdkMode SdkMode { get; init; } = SdkMode.Legacy;
+    public IPAddress ListenIp { get; init; } = IPAddress.Any;
+    public int ListenPort { get; init; } = DefaultListenPort;
+    public IReadOnlyList<byte> AlarmChannels { get; init; } = new byte[] { 1, 1, 1, 1 }; // channel_1..channel_4, 0 = off, 1 = on
+    public TimeSpan ReplyTimeout { get; init; } = TimeSpan.FromMilliseconds(DefaultReplyTimeoutMs);
 
     sealed class FileModel
     {
         public string? ServerUrl { get; set; }
         public int? CooldownSeconds { get; set; }
         public Dictionary<string, string>? Gates { get; set; }
+        // Read as raw JSON and checked by hand, so a wrong type ("listenPort": "9000") gets the same clear message
+        // as a wrong value, instead of falling back to legacy mode like an unreadable file does.
+        public JsonElement? SdkMode { get; set; }
+        public JsonElement? ListenIp { get; set; }
+        public JsonElement? ListenPort { get; set; }
+        public JsonElement? AlarmChannels { get; set; }
+        public JsonElement? ReplyTimeoutMs { get; set; }
     }
 
     static readonly JsonSerializerOptions FileOptions = new()
@@ -34,7 +57,8 @@ sealed class BridgeConfig
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, // a misspelt key is reported, not silently ignored
     };
 
-    // Every problem is reported through warn and leaves the app running in log-only mode.
+    // Every problem is reported through warn and leaves the app running in log-only (legacy) mode, except a bad value
+    // for one of the v2 settings, which throws ConfigException.
     public static BridgeConfig Load(string path, Action<string> warn)
     {
         if (!File.Exists(path))
@@ -53,6 +77,14 @@ sealed class BridgeConfig
     public static BridgeConfig Parse(string json, Action<string> warn)
     {
         FileModel file = JsonSerializer.Deserialize<FileModel>(json, FileOptions) ?? new FileModel();
+
+        SdkMode mode = ReadSdkMode(file.SdkMode);
+        IPAddress listenIp = ReadListenIp(file.ListenIp);
+        int listenPort = ReadWholeNumber(file.ListenPort, "listenPort", DefaultListenPort, 1, 65535,
+            "Use a port number from 1 to 65535, for example 9000.");
+        byte[] alarmChannels = ReadAlarmChannels(file.AlarmChannels);
+        int replyTimeoutMs = ReadWholeNumber(file.ReplyTimeoutMs, "replyTimeoutMs", DefaultReplyTimeoutMs, 1, 600_000,
+            "Use a number of milliseconds from 1 to 600000, for example 5000.");
 
         var gates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (ip, name) in file.Gates ?? new())
@@ -79,7 +111,54 @@ sealed class BridgeConfig
             alarmUrl = null;
         }
 
-        return new BridgeConfig { AlarmUrl = alarmUrl, Cooldown = cooldown, Gates = gates };
+        return new BridgeConfig
+        {
+            AlarmUrl = alarmUrl, Cooldown = cooldown, Gates = gates,
+            SdkMode = mode, ListenIp = listenIp, ListenPort = listenPort, AlarmChannels = alarmChannels,
+            ReplyTimeout = TimeSpan.FromMilliseconds(replyTimeoutMs),
+        };
+    }
+
+    // A missing key or null means "use the default".
+    static JsonElement? Given(JsonElement? value) =>
+        value is { ValueKind: not (JsonValueKind.Null or JsonValueKind.Undefined) } v ? v : null;
+
+    static SdkMode ReadSdkMode(JsonElement? value)
+    {
+        if (Given(value) is not JsonElement v) return SdkMode.Legacy;
+        string? text = v.ValueKind == JsonValueKind.String ? v.GetString()?.Trim() : null;
+        if (string.Equals(text, "legacy", StringComparison.OrdinalIgnoreCase)) return SdkMode.Legacy;
+        if (string.Equals(text, "v2", StringComparison.OrdinalIgnoreCase)) return SdkMode.V2;
+        throw new ConfigException($"sdkMode {v.GetRawText()} is not valid. Use \"legacy\" (the old card_7k.dll runs the TCP server) " +
+                                  "or \"v2\" (this app runs it, needs HAX's updated card_7k.dll).");
+    }
+
+    static IPAddress ReadListenIp(JsonElement? value)
+    {
+        if (Given(value) is not JsonElement v) return IPAddress.Any;
+        string text = v.ValueKind == JsonValueKind.String ? v.GetString()!.Trim() : "";
+        // IPAddress.TryParse also takes shorthands like "9000" (= 0.0.35.40), so an IPv4 address must have all four parts.
+        if (IPAddress.TryParse(text, out IPAddress? ip) && (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork || text.Count(c => c == '.') == 3))
+            return ip;
+        throw new ConfigException($"listenIp {v.GetRawText()} is not an IP address. Use \"0.0.0.0\" (listen on every network " +
+                                  "card of this PC) or one of this PC's own IP addresses.");
+    }
+
+    static int ReadWholeNumber(JsonElement? value, string key, int fallback, int min, int max, string hint)
+    {
+        if (Given(value) is not JsonElement v) return fallback;
+        if (v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out int n) && n >= min && n <= max) return n;
+        throw new ConfigException($"{key} {v.GetRawText()} is not valid. {hint}");
+    }
+
+    static byte[] ReadAlarmChannels(JsonElement? value)
+    {
+        if (Given(value) is not JsonElement v) return new byte[] { 1, 1, 1, 1 };
+        if (v.ValueKind == JsonValueKind.Array && v.GetArrayLength() == 4
+            && v.EnumerateArray().All(c => c.ValueKind == JsonValueKind.Number && c.TryGetInt32(out int n) && n is 0 or 1))
+            return v.EnumerateArray().Select(c => (byte)c.GetInt32()).ToArray();
+        throw new ConfigException($"alarmChannels {v.GetRawText()} is not valid. Use a list of 4 numbers, one per alarm " +
+                                  "channel, each 0 (off) or 1 (on), for example [1,1,1,1].");
     }
 }
 
@@ -179,7 +258,8 @@ sealed class Cooldown(TimeSpan window)
 
 record AlarmItem(string Epc, string ReaderName, DateTime ScannedAt, TimeSpan QueuedAt);
 
-// Offer() runs on card_7k.dll's callback thread and only does a cooldown check and a non-blocking queue write.
+// Offer() runs on card_7k.dll's callback thread (OfferForReader() on a v2 gate's task) and only does a cooldown
+// check and a non-blocking queue write.
 // One background worker posts the queued items, one at a time, with a single shared HttpClient.
 sealed class AlarmBridge
 {
@@ -211,12 +291,16 @@ sealed class AlarmBridge
 
     static TimeSpan Now() => TimeSpan.FromMilliseconds(Environment.TickCount64);
 
-    public void Offer(string connId, string epc)
+    // Legacy mode: card_7k.dll's connID ("ip:port") is turned into the reader name here.
+    public void Offer(string connId, string epc) => OfferForReader(AlarmRules.ReaderName(connId, gates), epc);
+
+    // v2 mode: V2GateServer already turned the gate socket's remote IP into the reader name, by the same rule.
+    public void OfferForReader(string readerName, string epc)
     {
         TimeSpan now = Now();
         if (!cooldown.TryStart(epc, now)) return;
         Interlocked.Increment(ref pending);
-        if (queue.Writer.TryWrite(new AlarmItem(epc, AlarmRules.ReaderName(connId, gates), DateTime.UtcNow, now))) return;
+        if (queue.Writer.TryWrite(new AlarmItem(epc, readerName, DateTime.UtcNow, now))) return;
         Interlocked.Decrement(ref pending);
         cooldown.Clear(epc, now);
         if (!stopped) log($"SEND FAILED epc={epc} not queued, {QueueCapacity} alarms are already waiting");

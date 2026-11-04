@@ -3,5 +3,10 @@
   "cooldownSeconds": 30,
   "gates": {
     "169.254.68.93": "GATE-1"
-  }
+  },
+  "sdkMode": "legacy",
+  "listenIp": "0.0.0.0",
+  "listenPort": 9000,
+  "alarmChannels": [1, 1, 1, 1],
+  "replyTimeoutMs": 5000
 }
