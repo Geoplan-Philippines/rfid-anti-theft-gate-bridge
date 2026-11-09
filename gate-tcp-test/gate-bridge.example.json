@@ -8,5 +8,8 @@
   "listenIp": "0.0.0.0",
   "listenPort": 9000,
   "alarmChannels": [1, 1, 1, 1],
-  "replyTimeoutMs": 5000
+  "replyTimeoutMs": 5000,
+  "physicalAlarm": "off",
+  "soldCheckTimeoutMs": 800,
+  "onSoldCheckFailure": "alarm"
 }

@@ -46,6 +46,9 @@ static class HaxError
     public const int FlagUnknown = 14;
     public const int Network = 20;
 
+    // The unpack functions passed header, length and CRC and read the gate's flag: ok, or the gate's own refusal.
+    public static bool IsDeviceAnswer(int code) => code is Ok or FlagFail or FlagAbnormal or FlagDuplicate or FlagUnknown;
+
     public static string Text(int code) => code switch
     {
         Ok => "ok",
@@ -71,14 +74,22 @@ static class EpcJson
     // EPCs are trimmed and upper-cased, the same form legacy mode sends (Convert.ToHexString).
     public static (IReadOnlyList<EpcTag> Tags, string? Problem) Parse(string json)
     {
+        (IReadOnlyList<EpcTag> tags, string? problem, _) = ParseCounting(json);
+        return (tags, problem);
+    }
+
+    // As Parse, plus how many reported tags have no usable EPC: the skipped items, or 1 when the JSON could not be
+    // read at all (there was at least one tag, number unknown). The physical alarm treats those as unknown, not sold.
+    public static (IReadOnlyList<EpcTag> Tags, string? Problem, int UnreadableTags) ParseCounting(string json)
+    {
         JsonDocument doc;
         try { doc = JsonDocument.Parse(json); }
-        catch (JsonException ex) { return ([], $"not valid JSON ({ex.Message})"); }
+        catch (JsonException ex) { return ([], $"not valid JSON ({ex.Message})", 1); }
 
         using (doc)
         {
             JsonElement root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Array) return ([], $"expected a JSON array, got {root.ValueKind}");
+            if (root.ValueKind != JsonValueKind.Array) return ([], $"expected a JSON array, got {root.ValueKind}", 1);
 
             var tags = new List<EpcTag>();
             var skipped = new List<int>();
@@ -102,7 +113,7 @@ static class EpcJson
                 0 => null,
                 1 => $"item {skipped[0]} of {item} has no epc_id, skipped",
                 _ => $"items {string.Join(", ", skipped)} of {item} have no epc_id, skipped",
-            });
+            }, skipped.Count);
         }
     }
 }

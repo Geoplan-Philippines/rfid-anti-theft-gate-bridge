@@ -13,6 +13,14 @@ namespace GateTcpTest;
 // legacy: card_7k.dll runs the TCP server and calls OutputTags. v2: this app runs the server (V2GateServer.cs).
 enum SdkMode { Legacy, V2 }
 
+// v2 only. Off: no per-tag alarm commands; the alarm channels command is still sent once when a gate connects, as
+// before. Selective: nothing at connect; one alarm command per checked batch that holds an unsold (or, per policy,
+// unknown) tag. See GateAlarmCoordinator.cs.
+enum PhysicalAlarmMode { Off, Selective }
+
+// What the gate does when the sold check gives no answer for a tag (timeout, 429, 5xx, bad or missing answer).
+enum SoldCheckFailurePolicy { Alarm, Silent }
+
 // A gate-bridge.json value that would make the app talk to the gate wrongly. Unlike a warning, it stops the app at startup.
 sealed class ConfigException(string message) : Exception(message);
 
@@ -23,8 +31,12 @@ sealed class BridgeConfig
     public const int DefaultCooldownSeconds = 30;
     public const int DefaultListenPort = 9000;
     public const int DefaultReplyTimeoutMs = 5000;
+    public const int DefaultSoldCheckTimeoutMs = 800;
+    public const string SoldCheckPath = "/api/v1/anti-theft/known-epcs/check";
+    public static readonly IReadOnlyList<byte> TestedAlarmChannels = new byte[] { 1, 1, 1, 1 };
 
     public Uri? AlarmUrl { get; init; }
+    public Uri? SoldCheckUrl { get; init; } // set whenever AlarmUrl is; only used in selective mode
     public TimeSpan Cooldown { get; init; } = TimeSpan.FromSeconds(DefaultCooldownSeconds);
     public IReadOnlyDictionary<string, string> Gates { get; init; } = new Dictionary<string, string>();
 
@@ -34,6 +46,9 @@ sealed class BridgeConfig
     public int ListenPort { get; init; } = DefaultListenPort;
     public IReadOnlyList<byte> AlarmChannels { get; init; } = new byte[] { 1, 1, 1, 1 }; // channel_1..channel_4, 0 = off, 1 = on
     public TimeSpan ReplyTimeout { get; init; } = TimeSpan.FromMilliseconds(DefaultReplyTimeoutMs);
+    public PhysicalAlarmMode PhysicalAlarm { get; init; } = PhysicalAlarmMode.Off;
+    public TimeSpan SoldCheckTimeout { get; init; } = TimeSpan.FromMilliseconds(DefaultSoldCheckTimeoutMs);
+    public SoldCheckFailurePolicy OnSoldCheckFailure { get; init; } = SoldCheckFailurePolicy.Alarm;
 
     sealed class FileModel
     {
@@ -47,6 +62,9 @@ sealed class BridgeConfig
         public JsonElement? ListenPort { get; set; }
         public JsonElement? AlarmChannels { get; set; }
         public JsonElement? ReplyTimeoutMs { get; set; }
+        public JsonElement? PhysicalAlarm { get; set; }
+        public JsonElement? SoldCheckTimeoutMs { get; set; }
+        public JsonElement? OnSoldCheckFailure { get; set; }
     }
 
     static readonly JsonSerializerOptions FileOptions = new()
@@ -85,6 +103,12 @@ sealed class BridgeConfig
         byte[] alarmChannels = ReadAlarmChannels(file.AlarmChannels);
         int replyTimeoutMs = ReadWholeNumber(file.ReplyTimeoutMs, "replyTimeoutMs", DefaultReplyTimeoutMs, 1, 600_000,
             "Use a number of milliseconds from 1 to 600000, for example 5000.");
+        PhysicalAlarmMode physicalAlarm = ReadChoice(file.PhysicalAlarm, "physicalAlarm", PhysicalAlarmMode.Off,
+            ("off", PhysicalAlarmMode.Off), ("selective", PhysicalAlarmMode.Selective));
+        int soldCheckTimeoutMs = ReadWholeNumber(file.SoldCheckTimeoutMs, "soldCheckTimeoutMs", DefaultSoldCheckTimeoutMs, 1, 60_000,
+            "Use a number of milliseconds from 1 to 60000, for example 800.");
+        SoldCheckFailurePolicy onFailure = ReadChoice(file.OnSoldCheckFailure, "onSoldCheckFailure", SoldCheckFailurePolicy.Alarm,
+            ("alarm", SoldCheckFailurePolicy.Alarm), ("silent", SoldCheckFailurePolicy.Silent));
 
         var gates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (ip, name) in file.Gates ?? new())
@@ -110,13 +134,37 @@ sealed class BridgeConfig
             warn($"serverUrl \"{serverUrl}\" is not an http:// or https:// address");
             alarmUrl = null;
         }
+        Uri? soldCheckUrl = alarmUrl == null ? null : new Uri(serverUrl.TrimEnd('/') + SoldCheckPath);
+
+        if (physicalAlarm == PhysicalAlarmMode.Selective)
+        {
+            if (soldCheckUrl == null)
+                throw new ConfigException("physicalAlarm \"selective\" needs serverUrl: the gate only sounds after the server " +
+                                          "says whether each tag is sold. Set serverUrl, for example \"http://localhost:8000\".");
+            if (mode != SdkMode.V2)
+                warn("physicalAlarm only applies when sdkMode is \"v2\"; legacy mode ignores it");
+            else if (!alarmChannels.SequenceEqual(TestedAlarmChannels))
+                warn($"alarmChannels [{string.Join(",", alarmChannels)}] has not been tested on the gate; only [1,1,1,1] has");
+        }
 
         return new BridgeConfig
         {
-            AlarmUrl = alarmUrl, Cooldown = cooldown, Gates = gates,
+            AlarmUrl = alarmUrl, SoldCheckUrl = soldCheckUrl, Cooldown = cooldown, Gates = gates,
             SdkMode = mode, ListenIp = listenIp, ListenPort = listenPort, AlarmChannels = alarmChannels,
             ReplyTimeout = TimeSpan.FromMilliseconds(replyTimeoutMs),
+            PhysicalAlarm = physicalAlarm, SoldCheckTimeout = TimeSpan.FromMilliseconds(soldCheckTimeoutMs),
+            OnSoldCheckFailure = onFailure,
         };
+    }
+
+    static T ReadChoice<T>(JsonElement? value, string key, T fallback, params (string Text, T Value)[] choices)
+    {
+        if (Given(value) is not JsonElement v) return fallback;
+        string? text = v.ValueKind == JsonValueKind.String ? v.GetString()?.Trim() : null;
+        foreach ((string name, T choice) in choices)
+            if (string.Equals(text, name, StringComparison.OrdinalIgnoreCase)) return choice;
+        throw new ConfigException($"{key} {v.GetRawText()} is not valid. Use " +
+                                  string.Join(" or ", choices.Select(c => $"\"{c.Text}\"")) + ".");
     }
 
     // A missing key or null means "use the default".

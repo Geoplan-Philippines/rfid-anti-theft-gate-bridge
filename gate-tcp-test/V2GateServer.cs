@@ -1,6 +1,8 @@
 // v2 mode: this app owns the TCP listener and every gate socket; card_7k.dll only builds and parses packets
-// (IHaxSdk). Follows HAX's sdk-v2\main.cpp, except that every gate gets its own task, so several can connect at once.
-// Per gate: 1. take server control, 2. set the alarm channels, 3. turn every tag packet into tags for the bridge.
+// (IHaxSdk). Follows HAX's main.cpp, except that every gate gets its own task, so several can connect at once.
+// Per gate: 1. take server control, 2. (physicalAlarm "off" only) set the alarm channels once, as before,
+// 3. read the socket with one reader (PacketAssembler, GateStream.cs): every tag goes to the dashboard bridge (onTag),
+// and in selective mode also to the gate's GateAlarmCoordinator, which decides per batch whether the gate sounds.
 // Only bytes the SDK built are ever sent. Nothing here touches card_7k.dll, so the test project compiles it directly.
 using System.Collections.Concurrent;
 using System.Net;
@@ -19,6 +21,8 @@ sealed class V2GateServer : IDisposable
     public const int JsonBufferSize = 10240;  // first try for Device_UnPackEpcId; it says when it needs more
     const int MaxJsonBytes = 16 << 20;        // never allocate more than this, whatever size the SDK asks for
     const int MaxHexBytes = 256;              // longest packet printed in full on a BAD PACKET line
+    // How long bytes the SDK rejected wait for the rest of their packet (SDK-validated reassembly only).
+    public static readonly TimeSpan FragmentWait = TimeSpan.FromMilliseconds(500);
 
     readonly IHaxSdk sdk;
     readonly IPEndPoint listenOn;
@@ -27,6 +31,10 @@ sealed class V2GateServer : IDisposable
     readonly IReadOnlyDictionary<string, string> gates;
     readonly Action<string, string> onTag; // (readerName, epc), never blocks
     readonly Action<string> log;
+    readonly PhysicalAlarmMode physicalAlarm;
+    readonly SoldCheckFailurePolicy onSoldCheckFailure;
+    readonly ISoldStatusClient? soldCheck;
+    readonly bool reassemble;
     readonly CancellationTokenSource stopping = new();
     readonly ConcurrentDictionary<int, TcpClient> connections = new();
     readonly ConcurrentDictionary<int, Task> gateTasks = new();
@@ -35,7 +43,10 @@ sealed class V2GateServer : IDisposable
     int lastId;
     int stopped;
 
-    public V2GateServer(IHaxSdk sdk, BridgeConfig config, Action<string, string> onTag, Action<string> log)
+    // soldCheck is required when config.PhysicalAlarm is Selective. reassemble: SDK-validated reassembly of split and
+    // joined TCP reads (GateStream.cs); only true when SdkSelfCheck verified the loaded DLL.
+    public V2GateServer(IHaxSdk sdk, BridgeConfig config, Action<string, string> onTag, Action<string> log,
+        ISoldStatusClient? soldCheck = null, bool reassemble = false)
     {
         this.sdk = sdk;
         listenOn = new IPEndPoint(config.ListenIp, config.ListenPort);
@@ -44,6 +55,12 @@ sealed class V2GateServer : IDisposable
         gates = config.Gates;
         this.onTag = onTag;
         this.log = log;
+        physicalAlarm = config.PhysicalAlarm;
+        onSoldCheckFailure = config.OnSoldCheckFailure;
+        this.soldCheck = soldCheck;
+        this.reassemble = reassemble;
+        if (physicalAlarm == PhysicalAlarmMode.Selective && soldCheck == null)
+            throw new ArgumentException("selective physical alarm needs a sold check client", nameof(soldCheck));
     }
 
     // Where it really listens (port 0 in the config means any free port, used by the tests).
@@ -130,26 +147,24 @@ sealed class V2GateServer : IDisposable
             log($"GATE OPEN   reader={reader} remote={remote}");
             NetworkStream stream = client.GetStream();
 
+            // Selective mode sends no alarm command at connect: the gate only sounds for an unsold (or unknown) tag.
             if (!await StepAsync(stream, reader, "server control",
                     (Span<byte> buf, out int len) => sdk.PackServerControl(1, buf, out len), sdk.UnPackServerControl)
-                || !await StepAsync(stream, reader, "alarm channels",
-                    (Span<byte> buf, out int len) => sdk.PackDeviceAlarm(alarmChannels, buf, out len), sdk.UnPackDeviceAlarm))
+                || (physicalAlarm == PhysicalAlarmMode.Off && !await StepAsync(stream, reader, "alarm channels",
+                    (Span<byte> buf, out int len) => sdk.PackDeviceAlarm(alarmChannels, buf, out len), sdk.UnPackDeviceAlarm)))
             {
                 log($"GATE CLOSED reader={reader} remote={remote} closed by this app after the failed step");
                 return;
             }
 
-            var data = new byte[TagBufferSize];
-            var json = new byte[JsonBufferSize];
-            while (true)
+            GateAlarmCoordinator? alarms = physicalAlarm == PhysicalAlarmMode.Selective
+                ? new GateAlarmCoordinator(reader, soldCheck!, onSoldCheckFailure, replyTimeout,
+                    cancel => SendAlarmAsync(stream, reader, cancel), log)
+                : null;
+            try { await ReadLoopAsync(stream, reader, remote, alarms); }
+            finally
             {
-                int n = await stream.ReadAsync(data, stopping.Token);
-                if (n == 0)
-                {
-                    log($"GATE CLOSED reader={reader} remote={remote} the gate disconnected");
-                    return;
-                }
-                HandleTagPacket(reader, data.AsSpan(0, n), json);
+                if (alarms != null) await alarms.DisposeAsync();
             }
         }
         catch (Exception) when (stopping.IsCancellationRequested)
@@ -210,25 +225,90 @@ sealed class V2GateServer : IDisposable
         return false;
     }
 
-    // One recv = one packet. A packet the SDK rejects is printed and skipped; the connection stays open.
-    void HandleTagPacket(string reader, ReadOnlySpan<byte> packet, byte[] jsonBuf)
+    // The only reader of this socket. Bytes the SDK rejected may wait up to FragmentWait for the rest of their packet;
+    // the pending read is kept (never cancelled) while waiting, so no byte is lost.
+    async Task ReadLoopAsync(NetworkStream stream, string reader, string remote, GateAlarmCoordinator? alarms)
     {
-        int rc = UnpackEpcJson(sdk, packet, jsonBuf, out string json);
-        if (rc != HaxError.Ok)
+        var assembler = new PacketAssembler(sdk, reassemble);
+        var data = new byte[TagBufferSize];
+        Task<int>? read = null;
+        while (true)
         {
-            log($"BAD PACKET  reader={reader} {HaxError.Text(rc)}, code {rc}, {packet.Length} bytes: {Hex(packet, MaxHexBytes)} (connection stays open)");
-            return;
-        }
+            read ??= stream.ReadAsync(data, stopping.Token).AsTask();
+            if (assembler.HasPending && await Task.WhenAny(read, Task.Delay(FragmentWait, stopping.Token)) != read)
+            {
+                if (assembler.Flush() is GateMessage stale) Handle(reader, stale, alarms);
+                continue;
+            }
 
-        (IReadOnlyList<EpcTag> tags, string? problem) = EpcJson.Parse(json);
-        if (problem != null)
-            log($"BAD PACKET  reader={reader} tag JSON from the SDK: {problem}: {Shorten(json)} (connection stays open)");
-        foreach (EpcTag tag in tags)
+            int n = await read;
+            read = null;
+            if (n == 0)
+            {
+                if (assembler.Flush() is GateMessage rest) Handle(reader, rest, alarms);
+                log($"GATE CLOSED reader={reader} remote={remote} the gate disconnected");
+                return;
+            }
+            foreach (GateMessage message in assembler.Feed(data.AsSpan(0, n), alarms?.AlarmOutstanding ?? false))
+                Handle(reader, message, alarms);
+        }
+    }
+
+    // A message the SDK rejects is printed and skipped; the connection stays open.
+    void Handle(string reader, GateMessage message, GateAlarmCoordinator? alarms)
+    {
+        switch (message)
+        {
+            case TagMessage tags:
+                HandleTags(reader, tags, alarms);
+                break;
+            case AlarmReplyMessage reply when alarms != null:
+                alarms.OnReply(reply.Code);
+                break;
+            case AlarmReplyMessage reply:
+                log($"BAD PACKET  reader={reader} an alarm reply ({HaxError.Text(reply.Code)}, code {reply.Code}) but no alarm command " +
+                    $"was sent, {reply.Bytes.Length} bytes: {Hex(reply.Bytes, MaxHexBytes)} (connection stays open)");
+                break;
+            case UnreadableMessage bad:
+                log($"BAD PACKET  reader={reader} {HaxError.Text(bad.Code)}, code {bad.Code}, {bad.Bytes.Length} bytes: " +
+                    $"{Hex(bad.Bytes, MaxHexBytes)} (connection stays open)");
+                break;
+        }
+    }
+
+    // Every tag goes to the dashboard bridge whatever the physical decision; in selective mode also to the coordinator.
+    void HandleTags(string reader, TagMessage packet, GateAlarmCoordinator? alarms)
+    {
+        if (packet.Problem != null)
+            log($"BAD PACKET  reader={reader} tag JSON from the SDK: {packet.Problem}: {Shorten(packet.Json)} (connection stays open)");
+        foreach (EpcTag tag in packet.Tags)
         {
             log($"TAG         reader={reader} ant={tag.AntId?.ToString() ?? "?"} epc={tag.Epc}");
             try { onTag(reader, tag.Epc); }
             catch (Exception ex) { log($"ERROR       reader={reader} epc={tag.Epc} not handed to the bridge: {ex.Message}"); }
         }
+        if (alarms != null && (packet.Tags.Count > 0 || packet.UnreadableTags > 0))
+            alarms.OfferTags(packet.Tags.Select(t => t.Epc).Distinct(StringComparer.Ordinal).ToList(), packet.UnreadableTags);
+    }
+
+    // The single writer after setup: called by the gate's coordinator, one command at a time.
+    async Task<bool> SendAlarmAsync(NetworkStream stream, string reader, CancellationToken cancel)
+    {
+        var packet = new byte[PacketBufferSize];
+        int rc = sdk.PackDeviceAlarm(alarmChannels, packet, out int len);
+        if (rc != HaxError.Ok)
+        {
+            log($"ALARM FAIL  reader={reader} alarm command not sent: {HaxError.Text(rc)} while building it, code {rc}");
+            return false;
+        }
+        if (len <= 0 || len > packet.Length)
+        {
+            log($"ALARM FAIL  reader={reader} alarm command not sent: the SDK built {len} bytes into a {packet.Length}-byte buffer");
+            return false;
+        }
+        log($"ALARM CMD   reader={reader} channels {alarmChannels}, {len} bytes: {Hex(packet.AsSpan(0, len))}");
+        await stream.WriteAsync(packet.AsMemory(0, len), cancel);
+        return true;
     }
 
     // Device_UnPackEpcId into jsonBuf. When the SDK answers "buffer too small", once more into a buffer of the size

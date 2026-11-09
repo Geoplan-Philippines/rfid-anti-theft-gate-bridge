@@ -5,3 +5,6 @@ obj/
 # Logs (test.log from gate-tcp-test, log/card_7k.log from card_7k.dll)
 *.log
 log/
+
+# Local bridge settings (deployment addresses): create from gate-tcp-test/gate-bridge.example.json
+gate-tcp-test/gate-bridge.json

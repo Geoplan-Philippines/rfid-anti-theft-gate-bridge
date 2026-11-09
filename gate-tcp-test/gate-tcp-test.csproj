@@ -14,16 +14,55 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <!-- Which HAX DLL set goes next to the exe. One build carries exactly one set; the two never share an output folder.
+         dotnet build                      legacy set (..\sdk), for sdkMode "legacy", output bin\Debug\net8.0\win-x86\ as before
+         dotnet build -p:HaxSdk=2.1.2.0    HAX's 2026-11-07 delivery, for sdkMode "v2", output bin\hax-2.1.2.0\Debug\net8.0\win-x86\
+       Every DLL must match sdk-manifests\<set>.sha256 (checked below, and again by the exe before it loads card_7k.dll). -->
+  <PropertyGroup>
+    <HaxSdk Condition="'$(HaxSdk)' == ''">legacy</HaxSdk>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(HaxSdk)' == 'legacy'">
+    <HaxSdkDir>..\sdk\</HaxSdkDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(HaxSdk)' == '2.1.2.0'">
+    <HaxSdkDir>..\hax-7000-sdk-2.1.2.0-2026-11-07\2.1.2.0\</HaxSdkDir>
+    <BaseOutputPath>bin\hax-2.1.2.0\</BaseOutputPath>
+    <IntermediateOutputPath>obj\hax-2.1.2.0\$(Configuration)\</IntermediateOutputPath>
+  </PropertyGroup>
+
   <ItemGroup>
-    <!-- card_7k.dll, common.dll, adapt_for_imports.dll and the Visual C++ 14.51 runtime they were built with.
-         ucrtbase.dll and api-ms-win-*.dll are skipped: Windows 10/11 always uses its own copies. -->
-    <None Include="..\sdk\*.dll" Exclude="..\sdk\ucrtbase.dll;..\sdk\api-ms-win-*.dll"
-          Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
-    <!-- config.ini and config\*.ini ship next to the vendor DLLs, so keep them there. -->
-    <None Include="..\sdk\**\*.ini"
+    <!-- card_7k.dll, common.dll, adapt_for_imports.dll and the Visual C++ runtime they were built with.
+         ucrtbase.dll and api-ms-win-*.dll are skipped: Windows 10/11 always uses its own copies.
+         Always copied, so a DLL left over from another set or copied in by hand is overwritten on every build. -->
+    <HaxSdkDll Include="$(HaxSdkDir)*.dll" Exclude="$(HaxSdkDir)ucrtbase.dll;$(HaxSdkDir)api-ms-win-*.dll" />
+    <None Include="@(HaxSdkDll)" Link="%(Filename)%(Extension)" CopyToOutputDirectory="Always" />
+    <!-- config.ini and config\*.ini ship next to the legacy DLLs, so keep them there. The 2.1.2.0 delivery has none. -->
+    <None Include="..\sdk\**\*.ini" Condition="'$(HaxSdk)' == 'legacy'"
           Link="%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <!-- Bridge settings, read from next to the exe. gate-bridge.json is yours to create from the example. -->
     <None Update="gate-bridge.json;gate-bridge.example.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The expected hashes of both sets, and which set this build carries (SdkManifest.cs). -->
+    <EmbeddedResource Include="sdk-manifests\*.sha256" LogicalName="hax-sdk-%(Filename).sha256" />
+    <AssemblyMetadata Include="HaxSdk" Value="$(HaxSdk)" />
   </ItemGroup>
+
+  <!-- Stop the build when the chosen set is unknown, or its folder no longer matches HAX's delivery. -->
+  <Target Name="VerifyHaxSdkSet" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(HaxSdkDir)' == ''" Text="HaxSdk '$(HaxSdk)' is not a known DLL set. Use legacy (the default) or 2.1.2.0." />
+    <ReadLinesFromFile File="sdk-manifests\$(HaxSdk).sha256">
+      <Output TaskParameter="Lines" ItemName="_HaxSdkExpected" />
+    </ReadLinesFromFile>
+    <GetFileHash Files="@(HaxSdkDll)" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="_HaxSdkHashed" />
+    </GetFileHash>
+    <ItemGroup>
+      <_HaxSdkActual Include="@(_HaxSdkHashed->'%(FileHash)  %(Filename)%(Extension)'->ToLowerInvariant())" />
+      <_HaxSdkExpectedLower Include="@(_HaxSdkExpected->ToLowerInvariant())" />
+      <_HaxSdkUnexpected Include="@(_HaxSdkActual)" Exclude="@(_HaxSdkExpectedLower)" />
+      <_HaxSdkMissing Include="@(_HaxSdkExpectedLower)" Exclude="@(_HaxSdkActual)" />
+    </ItemGroup>
+    <Error Condition="'@(_HaxSdkUnexpected)' != '' or '@(_HaxSdkMissing)' != ''"
+           Text="$(HaxSdkDir) does not match sdk-manifests\$(HaxSdk).sha256. Not in the manifest: @(_HaxSdkUnexpected, ', '). Missing or changed: @(_HaxSdkMissing, ', '). Restore HAX's original files; never mix DLLs from two deliveries." />
+  </Target>
 
 </Project>

@@ -16,6 +16,12 @@
     <!-- v2 mode's server and SDK interface are DLL-free too; the tests drive them with FakeHaxSdk. -->
     <Compile Include="..\gate-tcp-test\HaxSdk.cs" Link="HaxSdk.cs" />
     <Compile Include="..\gate-tcp-test\V2GateServer.cs" Link="V2GateServer.cs" />
+    <!-- Selective physical alarm, stream handling, SDK self-check and SDK set check: DLL-free as well. -->
+    <Compile Include="..\gate-tcp-test\SoldCheck.cs" Link="SoldCheck.cs" />
+    <Compile Include="..\gate-tcp-test\GateStream.cs" Link="GateStream.cs" />
+    <Compile Include="..\gate-tcp-test\GateAlarmCoordinator.cs" Link="GateAlarmCoordinator.cs" />
+    <Compile Include="..\gate-tcp-test\SdkSelfCheck.cs" Link="SdkSelfCheck.cs" />
+    <Compile Include="..\gate-tcp-test\SdkManifest.cs" Link="SdkManifest.cs" />
     <!-- So a test can check that the shipped example file is accepted as it is. -->
     <None Include="..\gate-tcp-test\gate-bridge.example.json" Link="gate-bridge.example.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

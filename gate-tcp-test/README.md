@@ -64,14 +64,29 @@ because the server grabs a CCTV picture first):
 and only asks the DLL to build the packets it sends and to read the packets the gates send back. Several gates can be
 connected at once. Legacy mode (everything above) stays the default and works exactly as before.
 
-**You need HAX's updated `card_7k.dll`.** Copy it over the old one in the output folder, `bin\Debug\net8.0\win-x86\`,
-together with any other DLL HAX sends with it. Leave the `..\sdk` folder alone, legacy mode still uses it.
-`dotnet build` copies `..\sdk\card_7k.dll` again only when it is newer than the one in the output folder, so after a
-`dotnet clean` or on a fresh copy of the project, copy HAX's DLL again.
+**Build the v2 copy.** Each build carries exactly one HAX DLL set, in its own folder, so the two sets never mix:
+
+| Build command | DLL set | Run from | For |
+|---|---|---|---|
+| `dotnet build` | `..\sdk` (card_7k.dll 2.0.1.0) | `bin\Debug\net8.0\win-x86\` | `"sdkMode": "legacy"` |
+| `dotnet build -p:HaxSdk=2.1.2.0` | `..\hax-7000-sdk-2.1.2.0-2026-11-07\2.1.2.0` | `bin\hax-2.1.2.0\Debug\net8.0\win-x86\` | `"sdkMode": "v2"` |
+
+Never copy HAX DLLs into a `bin` folder by hand. The build checks every DLL of the chosen set against
+`sdk-manifests\<set>.sha256` (hashes of HAX's original files) and stops if one differs. The exe checks the DLLs next
+to it again before loading `card_7k.dll`. It refuses to start if any is from the other set (`common.dll` has the same
+version number in both sets, so only the hash tells them apart), or if `sdkMode` does not suit the set it was built with.
+
+**Check the DLL without a gate:** `bin\hax-2.1.2.0\Debug\net8.0\win-x86\gate-tcp-test.exe --check-sdk` loads HAX's
+2.1.2.0 DLL and checks it against packets captured from the gate during HAX's demo (firmware 7000202611040961). v2
+runs the same check at every start. The `SDK CHECK` lines say whether the DLL reads those packets, and whether a packet
+split over two TCP reads, or two packets in one read, can be cut apart using only the DLL's own checks. HAX documents
+no frame header or length field, so this check is the only evidence for that. When it passes, v2 handles split and
+joined reads; when it fails, each read is treated as one packet, as HAX's sample does, and the app warns at start.
 
 **Switch to v2:**
 1. In `gate-bridge.json` (see above; `gate-bridge.example.json` lists every setting) set `"sdkMode": "v2"`.
-2. Run `dotnet build` again, then run the app as before. The IP and port on the command line are for legacy mode only.
+2. Run `dotnet build -p:HaxSdk=2.1.2.0`, then run `bin\hax-2.1.2.0\Debug\net8.0\win-x86\gate-tcp-test.exe`.
+   The IP and port on the command line are for legacy mode only.
 3. Set each gate to connect to this PC's IP address and `listenPort` (**9000** by default, not 9090). The app prints
    this PC's addresses when it starts. If Windows asks about the firewall, allow it as in step 3 at the top.
 
@@ -80,30 +95,69 @@ together with any other DLL HAX sends with it. Leave the `..\sdk` folder alone, 
 | `sdkMode` | `"legacy"` | `"legacy"`: the old DLL runs the TCP server, as before. `"v2"`: this app runs it. |
 | `listenIp` | `"0.0.0.0"` | Address to listen on. `0.0.0.0` means every network card of this PC. |
 | `listenPort` | `9000` | Port the gates connect to. |
-| `alarmChannels` | `[1,1,1,1]` | Alarm channels 1 to 4, sent to each gate when it connects. `1` = on, `0` = off. |
-| `replyTimeoutMs` | `5000` | How long to wait for the gate's answer to each setup step, in milliseconds. |
+| `alarmChannels` | `[1,1,1,1]` | Alarm channels 1 to 4 for the alarm command. `1` = on, `0` = off. Only `[1,1,1,1]` has been tried on the gate. |
+| `replyTimeoutMs` | `5000` | How long to wait for the gate's answer to each setup step and each alarm command, in milliseconds. |
+| `physicalAlarm` | `"off"` | `"off"`: the alarm channels command is sent once when a gate connects, as before, and never per tag. `"selective"`: see below. |
+| `soldCheckTimeoutMs` | `800` | Selective only: how long to wait for the server's sold check, in milliseconds. There is no retry. |
+| `onSoldCheckFailure` | `"alarm"` | Selective only: what the gate does when the sold check gives no answer. `"alarm"`: sound it. `"silent"`: do not. |
 
-`serverUrl`, `cooldownSeconds` and `gates` work the same in both modes. A wrong value in one of the five settings above
+`serverUrl`, `cooldownSeconds` and `gates` work the same in both modes. A wrong value in one of the v2 settings above
 stops the app at startup with `ERROR: gate-bridge.json: ...`, which says what to write instead.
 
-**What to expect:** after `card_7k.dll loaded`, the line `Waiting for gates. Point each gate at ..., port 9000`.
-If the app prints `card_7k.dll has no Device_* functions. You need HAX's updated DLL.` and closes, the old DLL is
-still in the output folder.
+**What to expect:** after `card_7k.dll loaded` and the `SDK CHECK` lines, the line
+`Waiting for gates. Point each gate at ..., port 9000`.
 
 | Line | Meaning |
 |---|---|
 | `GATE OPEN   reader=GATE-1 remote=192.168.1.50:50113` | A gate connected. `reader` is its name from `gates`, or its IP. |
 | `TO GATE     reader=GATE-1 server control, 9 bytes: ...` | The packet the DLL built, sent to the gate, in hex. Setup step 1 takes control of the gate. |
-| `FROM GATE   reader=GATE-1 server control, 8 bytes: ...` | The gate's raw answer, in hex. |
-| `STEP        reader=GATE-1 server control: ok` | The DLL accepted the answer. The same three lines follow for `alarm channels` (setup step 2). |
+| `FROM GATE   reader=GATE-1 server control, 9 bytes: ...` | The gate's raw answer, in hex. |
+| `STEP        reader=GATE-1 server control: ok` | The DLL accepted the answer. With `physicalAlarm` `"off"`, the same three lines follow for `alarm channels` (setup step 2). |
 | `STEP FAILED reader=GATE-1 alarm channels: unpack failed (header/length/CRC), code 4` | The gate refused, its answer was not accepted, or it did not answer in time. The app closes this gate's connection only; the gate can connect again. Give HAX the code and the hex lines above it if this keeps happening. |
 | `TAG         reader=GATE-1 ant=1 epc=E2000017...` | A tag the gate read, and on which antenna. It is sent to the server exactly as in legacy mode (same cooldown, same `ALARM SENT` and other lines). |
-| `BAD PACKET  reader=GATE-1 ...` | A packet from the gate the DLL could not read, and why. It is skipped and the connection stays open. |
+| `BAD PACKET  reader=GATE-1 ...` | Bytes from the gate the DLL could not read, and why. They are skipped and the connection stays open. |
 | `GATE CLOSED reader=GATE-1 remote=... the gate disconnected` | The gate went away, or the line says why the connection ended. It can connect again at any time. |
 
 **Keys in v2:** `Q` stops listening, closes every gate connection, waits up to 3 s for tags still being sent, then
 quits. `A`, `L`, `B0` and `B1` only print `not available in v2 mode`.
 
+## Selective physical alarm (v2, `"physicalAlarm": "selective"`)
+
+The gate itself sounds (lights and beep) only for tags that are not sold. Nothing is sent to the gate when it
+connects. For each tag packet, the app asks the server which tags are sold
+(`POST {serverUrl}/api/v1/anti-theft/known-epcs/check`, up to 100 tags per request, one request at a time per gate),
+then:
+
+| The server says | The gate |
+|---|---|
+| every tag in the packet is sold | stays silent |
+| any tag is not sold | gets one alarm command for the packet |
+| no answer in time, an error status (429, 5xx, ...), an unreadable answer, or no answer for a tag | gets one alarm command, unless `onSoldCheckFailure` is `"silent"`. The tag is logged as unknown, never as unsold. |
+
+This is separate from the dashboard: every tag is still sent to `/api/v1/alarms` as before (same cooldown, same
+retries, same CCTV snapshot), and that never delays the gate. A tag read again inside the dashboard's 30 s cooldown
+still sounds the gate again. At most one alarm command waits for the gate's reply per gate; a decision to alarm while
+one waits is covered by it (and sent once more if that command fails). When 4 checks (up to 400 tags) are already
+waiting for one gate, further tags are not dropped: they count as unknown and follow `onSoldCheckFailure`.
+
+`"selective"` without a valid `serverUrl` stops the app at startup.
+
+| Line | Meaning |
+|---|---|
+| `SOLD CHECK  reader=GATE-1 2 tag(s): 1 sold, 1 unsold, 0 unknown (12 ms)` | The server's answer for one packet. |
+| `CHECK FAIL  reader=GATE-1 HTTP 503 ...; sold status unknown for E2...` | The sold check gave no answer for these tags. |
+| `NO ALARM    reader=GATE-1 all 2 tag(s) sold` | Every tag is sold: nothing is sent to the gate. |
+| `GATE ALARM  reader=GATE-1 unsold: E2...` | The gate should sound, and why (`unsold: ...` or `sold status unknown ...`). |
+| `ALARM CMD   reader=GATE-1 channels [1,1,1,1], 9 bytes: ...` | The alarm command sent to the gate, in hex. |
+| `ALARM OK    reader=GATE-1 the gate accepted the alarm command (40 ms)` | The gate's reply to it. |
+| `ALARM FAIL  reader=GATE-1 ...` | The gate refused the command, did not reply within `replyTimeoutMs`, or it could not be sent. The connection stays open; the next unsold read tries again. |
+| `ALARM LATE  reader=GATE-1 ...` | A reply arrived after its command had timed out. |
+| `ALARM BUSY  reader=GATE-1 ...` | An alarm was decided while a command was still waiting for its reply; that command covers it. |
+| `QUEUE FULL  reader=GATE-1 ...` | Too many checks waiting for this gate: the rest count as unknown. |
+
+**Not yet confirmed on the gate:** what each of the four alarm channels does, and whether the alarm command is a
+one-shot alarm or switches on an alarm mode that lasts. Check both on the real gate before relying on selective mode.
+
 **Tests** (no gate or server needed): from the `gate-tcp-test.Tests` folder next to this one, run `dotnet test`.
-They take about a minute because one test runs a slow fake server for real. The v2 tests use a fake DLL and fake
-gates on this PC, so they need neither a gate nor HAX's updated DLL.
+They take about a minute because some tests run a slow fake server for real. The v2 tests use a fake DLL and fake
+gates on this PC; they test this app's logic, not HAX's protocol (`--check-sdk` checks the real DLL).

@@ -1,4 +1,4 @@
-// IHaxSdk on top of HAX's updated card_7k.dll: the five exports of sdk-v2\hax_7k_sdk.h, all __stdcall with
+// IHaxSdk on top of HAX's updated card_7k.dll (2.1.2.0 delivery, hax_7k_sdk.h): the five Device_* exports, all __stdcall with
 // undecorated names, 32-bit. The old card_7k.dll has other Device_* exports (Device_Init, Device_StartScan, ...)
 // but none of these five, so each name is looked up exactly.
 using System.Runtime.InteropServices;

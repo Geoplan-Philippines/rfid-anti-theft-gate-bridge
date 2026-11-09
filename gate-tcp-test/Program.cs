@@ -2,7 +2,10 @@
 // With a gate-bridge.json next to the exe it also sends every tag to the anti-theft server (see GateBridge.cs).
 // API source of truth: ..\hax_7k_adapt.h (32-bit only, #pragma pack(1), default cdecl calling convention).
 // "sdkMode": "v2" in gate-bridge.json switches to HAX's packet interface instead: this app runs the TCP server
-// itself and the DLL only builds and parses packets (RunV2, V2GateServer.cs, sdk-v2\hax_7k_sdk.h).
+// itself and the DLL only builds and parses packets (RunV2, V2GateServer.cs, HAX's 2.1.2.0 hax_7k_sdk.h).
+// Which DLL set sits next to the exe is chosen at build time (HaxSdk in gate-tcp-test.csproj) and checked by hash
+// before card_7k.dll is loaded (SdkManifest.cs). "gate-tcp-test.exe --check-sdk" checks the 2.1.2.0 DLL against
+// packets captured from the gate, without a gate (SdkSelfCheck.cs).
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -113,11 +116,13 @@ static class Program
 
     static int Main(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--check-sdk") return CheckSdk();
         string ip = args.Length > 0 ? args[0] : "0.0.0.0";
         uint port = 9090;
         if (!IPAddress.TryParse(ip, out _) || (args.Length > 1 && (!uint.TryParse(args[1], out port) || port is 0 or > 65535)))
         {
             Console.WriteLine("Usage: gate-tcp-test [listen-ip] [port]   (defaults: 0.0.0.0 9090)");
+            Console.WriteLine("       gate-tcp-test --check-sdk         (check the 2.1.2.0 DLL against captured gate packets)");
             return 2;
         }
 
@@ -133,7 +138,7 @@ static class Program
         StartBridge(config);
         if (config.SdkMode == SdkMode.V2) return RunV2(config, argsGiven: args.Length > 0);
 
-        if (!LoadSdk(out _))
+        if (!LoadSdk(SdkManifest.LegacySet, out _))
         {
             PauseIfInteractive();
             return 1;
@@ -208,7 +213,7 @@ static class Program
             $"{DeviceAlarmConfig.From(config.AlarmChannels)}, reply timeout {config.ReplyTimeout.TotalMilliseconds:0} ms");
         if (argsGiven)
             Log($"WARNING: the [listen-ip] [port] arguments only apply to legacy mode. v2 uses listenIp and listenPort from {BridgeConfig.FileName}.");
-        if (!LoadSdk(out IntPtr dll))
+        if (!LoadSdk(SdkManifest.V2Set, out IntPtr dll))
         {
             PauseIfInteractive();
             return 1;
@@ -220,7 +225,31 @@ static class Program
             return 1;
         }
 
-        var server = new V2GateServer(sdk, config, (reader, epc) => bridge?.OfferForReader(reader, epc), Log);
+        SdkSelfCheckReport check = RunSelfCheck(sdk);
+        bool selective = config.PhysicalAlarm == PhysicalAlarmMode.Selective;
+        if (!check.Decodes)
+        {
+            Log("ERROR: this card_7k.dll does not read the packets captured from the gate (see SDK CHECK above).");
+            if (selective)
+            {
+                Log("Selective alarms need it, so v2 does not start. Use HAX's 2.1.2.0 delivery unchanged.");
+                PauseIfInteractive();
+                return 1;
+            }
+        }
+        if (!check.BoundariesVerified)
+            Log("WARNING: split or joined TCP reads cannot be handled with this DLL: each read is treated as one packet, as HAX " +
+                "documents, and anything else is printed as BAD PACKET. This is a release blocker for selective alarms.");
+
+        HttpSoldStatusClient? soldCheck = selective ? new HttpSoldStatusClient(config.SoldCheckUrl!, config.SoldCheckTimeout) : null;
+        Log(selective
+            ? $"ALARM MODE  selective: no alarm at connect; each tag batch is checked at {config.SoldCheckUrl} (timeout " +
+              $"{config.SoldCheckTimeout.TotalMilliseconds:0} ms, no retry); unsold sounds the gate, all sold stays silent, no answer " +
+              $"{(config.OnSoldCheckFailure == SoldCheckFailurePolicy.Alarm ? "sounds the gate" : "stays silent")}"
+            : "ALARM MODE  off: alarm channels sent once when a gate connects, as before; no per-tag alarm commands");
+
+        var server = new V2GateServer(sdk, config, (reader, epc) => bridge?.OfferForReader(reader, epc), Log,
+            soldCheck, reassemble: check.BoundariesVerified);
         try { server.Start(); }
         catch (SocketException ex)
         {
@@ -410,14 +439,76 @@ static class Program
         catch (Exception ex) { Log($"TCP watch stopped: {ex.Message}"); }
     }
 
+    // "--check-sdk": load the 2.1.2.0 DLL and check it against the captured gate packets. Exit 0 only when it reads them
+    // and its packet boundaries are verified.
+    static int CheckSdk()
+    {
+        Log($"gate-tcp-test --check-sdk, {(Environment.Is64BitProcess ? 64 : 32)}-bit process");
+        if (!LoadSdk(SdkManifest.V2Set, out IntPtr dll)) return 1;
+        NativeHaxSdk? sdk = NativeHaxSdk.TryCreate(dll);
+        if (sdk == null)
+        {
+            Log(NativeHaxSdk.MissingFunctionsMessage);
+            return 1;
+        }
+        SdkSelfCheckReport report = RunSelfCheck(sdk);
+        Log($"SDK CHECK   result: reads the gate's packets {(report.Decodes ? "yes" : "NO")}, " +
+            $"packet boundaries verified {(report.BoundariesVerified ? "yes" : "NO")}");
+        return report.BoundariesVerified ? 0 : 1;
+    }
+
+    static SdkSelfCheckReport RunSelfCheck(IHaxSdk sdk)
+    {
+        SdkSelfCheckReport report = SdkSelfCheck.Run(sdk, CapturedPackets.Gate7000);
+        foreach (SdkCheckItem item in report.Items)
+            Log($"SDK CHECK   {(item.Passed ? "pass" : item.Group == SdkCheckGroup.Info ? "note" : "FAIL")}  {item.Name}: {item.Detail}");
+        return report;
+    }
+
+    // The DLLs next to the exe must be exactly the set this build carries, and that set must suit the mode.
+    static bool CheckSdkFiles(string requiredSet)
+    {
+        string? built = SdkManifest.BuiltSet;
+        if (built != requiredSet)
+        {
+            Log(requiredSet == SdkManifest.V2Set
+                ? $"ERROR: v2 mode needs the {SdkManifest.V2Set} DLL set, but this exe was built with the {built ?? "unknown"} set. Build it with " +
+                  $"'dotnet build -p:HaxSdk={SdkManifest.V2Set}' and run bin\\hax-{SdkManifest.V2Set}\\Debug\\net8.0\\win-x86\\gate-tcp-test.exe."
+                : $"ERROR: legacy mode needs the legacy DLL set, but this exe was built with the {built ?? "unknown"} set. Legacy mode " +
+                  "has not been tested with HAX's 2.1.2.0 DLLs. Build with 'dotnet build' and run bin\\Debug\\net8.0\\win-x86\\gate-tcp-test.exe.");
+            return false;
+        }
+
+        var manifests = new Dictionary<string, IReadOnlyDictionary<string, string>>();
+        foreach (string set in SdkManifest.Sets)
+            if (SdkManifest.EmbeddedText(set) is string text) manifests[set] = SdkManifest.Parse(text);
+        if (!manifests.TryGetValue(requiredSet, out IReadOnlyDictionary<string, string>? expected))
+        {
+            Log($"ERROR: this exe carries no hash list for the {requiredSet} DLL set. Rebuild it.");
+            return false;
+        }
+        IReadOnlyList<string> problems = SdkManifest.Verify(AppContext.BaseDirectory, requiredSet, expected,
+            manifests.Where(m => m.Key != requiredSet).ToDictionary(m => m.Key, m => m.Value));
+        foreach (string problem in problems) Log($"ERROR: {problem}");
+        if (problems.Count > 0)
+        {
+            Log($"The HAX DLLs next to the exe are not exactly the {requiredSet} set, so card_7k.dll is not loaded. Run 'dotnet build" +
+                $"{(requiredSet == SdkManifest.LegacySet ? "" : $" -p:HaxSdk={requiredSet}")}' again (it copies the whole set) and do not copy DLLs in by hand.");
+            return false;
+        }
+        Log($"SDK         {requiredSet} DLL set, all {expected.Count} files match");
+        return true;
+    }
+
     // Load card_7k.dll up front so a bad install gives a readable message instead of a crash on the first call.
-    static bool LoadSdk(out IntPtr handle)
+    static bool LoadSdk(string requiredSet, out IntPtr handle)
     {
         handle = IntPtr.Zero;
+        if (!CheckSdkFiles(requiredSet)) return false;
         string dll = Path.Combine(AppContext.BaseDirectory, "card_7k.dll");
         if (!File.Exists(dll))
         {
-            Log($"ERROR: {dll} not found. Run 'dotnet build' so the files from ..\\sdk are copied next to the exe.");
+            Log($"ERROR: {dll} not found. Run 'dotnet build' so the HAX DLLs are copied next to the exe.");
             return false;
         }
         try

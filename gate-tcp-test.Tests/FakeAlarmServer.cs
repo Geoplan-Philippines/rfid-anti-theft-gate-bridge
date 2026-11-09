@@ -1,4 +1,5 @@
-// A stand-in for POST /api/v1/alarms on 127.0.0.1 that records every request and answers however a test says.
+// A stand-in for POST /api/v1/alarms and POST /api/v1/anti-theft/known-epcs/check on 127.0.0.1 that records every
+// request and answers however a test says.
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
@@ -16,12 +17,23 @@ record Reply(int Status, string? Outcome = null, string? Message = null, bool Ab
     public static readonly Reply AlarmCreated = new(201, "alarm_created");
 }
 
+// An answer to a sold check: Body as it is (null = the server's normal answer from the sold list), after Delay.
+record CheckAnswer(int Status = 200, string? Body = null, TimeSpan Delay = default, bool Abort = false)
+{
+    public static readonly CheckAnswer FromSoldList = new();
+}
+
 sealed class FakeAlarmServer : IAsyncDisposable
 {
     readonly WebApplication app;
     int answered;
 
     public ConcurrentQueue<ReceivedPost> Posts { get; } = new();
+
+    // Sold checks: the EPCs of each request, in order. SoldEpcs is the sold list; Check says how to answer.
+    public ConcurrentQueue<string[]> Checks { get; } = new();
+    public ConcurrentDictionary<string, bool> SoldEpcs { get; } = new(StringComparer.Ordinal);
+    public Func<string[], CheckAnswer> Check { get; set; } = _ => CheckAnswer.FromSoldList;
     public int Answered => Volatile.Read(ref answered);
     public Uri BaseUrl { get; private set; } = null!;
 
@@ -52,7 +64,35 @@ sealed class FakeAlarmServer : IAsyncDisposable
                 ? new { statusCode = r.Status, message = "Success", data = new { outcome = r.Outcome } }
                 : (object)new { statusCode = r.Status, message = r.Message ?? "error", error = "Error" });
         });
+        app.MapPost("/api/v1/anti-theft/known-epcs/check", async (HttpContext ctx) =>
+        {
+            using JsonDocument body = await JsonDocument.ParseAsync(ctx.Request.Body);
+            string[] epcs = body.RootElement.GetProperty("epcs").EnumerateArray().Select(e => e.GetString() ?? "").ToArray();
+            Checks.Enqueue(epcs);
+            CheckAnswer answer = Check(epcs);
+
+            await Task.Delay(answer.Delay, ctx.RequestAborted);
+            if (answer.Abort)
+            {
+                ctx.Abort();
+                return;
+            }
+            ctx.Response.StatusCode = answer.Status;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(answer.Body ?? SoldListAnswer(epcs));
+        });
     }
+
+    // What the real server answers: one result per normalized EPC, first-seen order.
+    string SoldListAnswer(string[] epcs) => JsonSerializer.Serialize(new
+    {
+        statusCode = 200,
+        message = "Success",
+        data = new
+        {
+            results = epcs.Select(EpcText.Normalize).Distinct().Select(e => new { epc = e, sold = SoldEpcs.ContainsKey(e) }),
+        },
+    });
 
     public static async Task<FakeAlarmServer> StartAsync(TimeSpan delay, Func<int, string, Reply>? reply = null)
     {
@@ -71,6 +111,22 @@ sealed class FakeAlarmServer : IAsyncDisposable
             await Task.Delay(10);
         }
     }
+
+    // Selective physical alarm on 127.0.0.1, any free port, with this server for both the dashboard and the sold check.
+    public BridgeConfig SelectiveConfig(IReadOnlyDictionary<string, string> gates, int soldCheckTimeoutMs = 800,
+        SoldCheckFailurePolicy onFailure = SoldCheckFailurePolicy.Alarm, int replyTimeoutMs = 5000) => new()
+    {
+        AlarmUrl = new Uri(BaseUrl, "/api/v1/alarms"),
+        SoldCheckUrl = new Uri(BaseUrl, BridgeConfig.SoldCheckPath),
+        Gates = gates,
+        SdkMode = SdkMode.V2,
+        ListenIp = System.Net.IPAddress.Loopback,
+        ListenPort = 0,
+        ReplyTimeout = TimeSpan.FromMilliseconds(replyTimeoutMs),
+        PhysicalAlarm = PhysicalAlarmMode.Selective,
+        SoldCheckTimeout = TimeSpan.FromMilliseconds(soldCheckTimeoutMs),
+        OnSoldCheckFailure = onFailure,
+    };
 
     public BridgeConfig Config(IReadOnlyDictionary<string, string>? gates = null) => BridgeConfig.Parse(
         JsonSerializer.Serialize(new { serverUrl = BaseUrl.ToString(), gates = gates ?? new Dictionary<string, string> { ["169.254.68.93"] = "GATE-1" } }),
