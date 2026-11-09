@@ -31,7 +31,8 @@ dotnet build -p:HaxSdk=2.1.2.0
 .\bin\hax-2.1.2.0\Debug\net8.0\win-x86\gate-tcp-test.exe --check-sdk
 ```
 
-Step 3 should end with `reads the gate's packets yes, packet boundaries verified yes`.
+Step 3 should end with `reads the gate's packets yes, packet boundaries verified yes`. It needs internet: see the
+note on `eas-data.net` under [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
@@ -43,6 +44,7 @@ Step 3 should end with `reads the gate's packets yes, packet boundaries verified
 | Internet on the first build | NuGet restore. |
 | HAX's DLL sets in the repo (see [Layout](#layout)) | `sdk\` for legacy mode, `hax-7000-sdk-2.1.2.0-2026-11-07\2.1.2.0\` for v2 mode. |
 | A running `rfid-anti-theft-server` | Only to send tags anywhere. Without `serverUrl` the app only logs tags. Selective mode needs it. |
+| Outbound HTTPS to `eas-data.net` (HAX's server) | HAX's 2.1.2.0 `card_7k.dll` connects to it while unpacking tag packets (seen: `8.212.45.22:443`). When it cannot reach it, tag packets fail with code 20, `EPC verify could not reach the server`. What the DLL sends is not visible (TLS). |
 
 Windows Smart App Control can block freshly built DLLs or HAX's `common.dll` (it has done so on one dev PC). If
 `dotnet test` finds no tests, or the app stops at `Loading card_7k.dll`, check *Event Viewer > Applications and
@@ -253,6 +255,8 @@ to the socket.
 | No `GATE OPEN` | Network, gate destination IP/port, or firewall. |
 | Every tag beeps, `CHECK FAIL ... HTTP 404` | The server doesn't have `/api/v1/anti-theft/known-epcs/check` yet: deploy, rebuild and restart it. |
 | `dotnet test` finds no tests | Smart App Control blocked the freshly built test DLL; see Prerequisites. |
+| `SDK CHECK   FAIL  captured tag packet unpacks: EPC verify could not reach the server, code 20` (often after a ~10 s pause) | HAX's DLL could not reach `eas-data.net:443`. Check internet, DNS and firewall, then run `--check-sdk` again. |
+| `BAD PACKET ... EPC verify could not reach the server, code 20` while running | Same cause: those tags are neither reported nor alarmed until HAX's server is reachable again. |
 
 ## Known limitations
 
@@ -260,5 +264,7 @@ to the socket.
   hardware**. Confirm it before relying on selective mode.
 - What each of the four alarm channels does is unconfirmed; only `[1,1,1,1]` has been tried on a gate.
 - Bytes the DLL cannot read are logged as `BAD PACKET` and do not sound the gate.
+- HAX's 2.1.2.0 DLL depends on HAX's server (`eas-data.net`) to unpack tag packets. Without internet, tag packets fail
+  with code 20: they are logged as `BAD PACKET`, not reported to the dashboard, and do not sound the gate.
 - Legacy mode with the 2.1.2.0 DLLs is untested, so the app refuses it.
 - Gate endpoints (`/alarms`, `/known-epcs/check`) have no authentication yet (TODO in the server).
