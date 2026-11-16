@@ -460,6 +460,12 @@ static class Program
     static SdkSelfCheckReport RunSelfCheck(IHaxSdk sdk)
     {
         SdkSelfCheckReport report = SdkSelfCheck.Run(sdk, CapturedPackets.Gate7000);
+        for (int attempt = 2; !report.BoundariesVerified && attempt <= 3; attempt++)
+        {
+            Log($"SDK CHECK   retrying self-check (attempt {attempt} of 3) after 2 s...");
+            Thread.Sleep(2000);
+            report = SdkSelfCheck.Run(sdk, CapturedPackets.Gate7000);
+        }
         foreach (SdkCheckItem item in report.Items)
             Log($"SDK CHECK   {(item.Passed ? "pass" : item.Group == SdkCheckGroup.Info ? "note" : "FAIL")}  {item.Name}: {item.Detail}");
         return report;
@@ -532,6 +538,10 @@ static class Program
 
     static char ReadKey()
     {
+        if (!Environment.UserInteractive)
+        {
+            Thread.Sleep(Timeout.Infinite); // running as a background service (e.g. NSSM)
+        }
         if (!Console.IsInputRedirected) return Console.ReadKey(intercept: true).KeyChar;
         int c = Console.Read(); // piped input, used for scripted tests; end of input means quit
         return c < 0 ? 'Q' : (char)c;
@@ -539,7 +549,7 @@ static class Program
 
     static void PauseIfInteractive()
     {
-        if (Console.IsInputRedirected) return;
+        if (Console.IsInputRedirected || !Environment.UserInteractive) return;
         Console.WriteLine("Press any key to close.");
         Console.ReadKey(intercept: true);
     }
